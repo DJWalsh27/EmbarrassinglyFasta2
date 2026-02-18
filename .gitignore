@@ -11,9 +11,3 @@ results/
 
 # secrets (DO NOT COMMIT)
 manifests/secrets.env
-
-# logs (structure tracked; contents ignored)
-logs/runs/*
-logs/inputs/*
-logs/system/*
-!logs/**/.gitkeep
