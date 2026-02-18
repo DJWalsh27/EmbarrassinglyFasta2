@@ -11,16 +11,27 @@ KEY_NAME="${EC2_KEY_NAME:-my-ec2-key}"
 VOLUME_GB="${EC2_ROOT_GB:-1024}"
 CANDIDATES="${EC2_4GPU_CANDIDATES:-g4dn.12xlarge g5.12xlarge g6.12xlarge p3.8xlarge}"
 
-# Ubuntu 22.04 AMI via SSM (stable)
+# Resolve Ubuntu 22.04 AMI without SSM (Canonical owner 099720109477)
 AMI_ID="${EC2_AMI_ID:-}"
 if [[ -z "$AMI_ID" ]]; then
-  AMI_ID="$(aws ssm get-parameter \
+  AMI_ID="$(aws ec2 describe-images \
     --region "$AWS_REGION" --profile "$AWS_PROFILE" \
-    --name /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp3/ami-id \
-    --query "Parameter.Value" --output text)"
+    --owners 099720109477 \
+    --filters \
+      "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*" \
+      "Name=state,Values=available" \
+      "Name=virtualization-type,Values=hvm" \
+      "Name=root-device-type,Values=ebs" \
+    --query "sort_by(Images, &CreationDate)[-1].ImageId" \
+    --output text)"
 fi
 
-# Default VPC + default subnet
+if [[ -z "$AMI_ID" || "$AMI_ID" == "None" ]]; then
+  echo "ERROR: Could not resolve an Ubuntu 22.04 AMI. Set EC2_AMI_ID in manifests/secrets.env" >&2
+  exit 1
+fi
+
+# Default VPC
 VPC_ID="${EC2_VPC_ID:-}"
 if [[ -z "$VPC_ID" ]]; then
   VPC_ID="$(aws ec2 describe-vpcs \
@@ -29,6 +40,12 @@ if [[ -z "$VPC_ID" ]]; then
     --query "Vpcs[0].VpcId" --output text)"
 fi
 
+if [[ -z "$VPC_ID" || "$VPC_ID" == "None" ]]; then
+  echo "ERROR: Could not find default VPC. Set EC2_VPC_ID and EC2_SUBNET_ID in secrets.env" >&2
+  exit 1
+fi
+
+# Default subnet in that VPC (prefers default-for-az=true)
 SUBNET_ID="${EC2_SUBNET_ID:-}"
 if [[ -z "$SUBNET_ID" ]]; then
   SUBNET_ID="$(aws ec2 describe-subnets \
@@ -37,14 +54,29 @@ if [[ -z "$SUBNET_ID" ]]; then
     --query "Subnets[0].SubnetId" --output text)"
 fi
 
-# Security group (reuse or create)
+if [[ -z "$SUBNET_ID" || "$SUBNET_ID" == "None" ]]; then
+  # fallback: first subnet in default VPC
+  SUBNET_ID="$(aws ec2 describe-subnets \
+    --region "$AWS_REGION" --profile "$AWS_PROFILE" \
+    --filters Name=vpc-id,Values="$VPC_ID" \
+    --query "Subnets[0].SubnetId" --output text)"
+fi
+
+if [[ -z "$SUBNET_ID" || "$SUBNET_ID" == "None" ]]; then
+  echo "ERROR: Could not find a subnet. Set EC2_SUBNET_ID in secrets.env" >&2
+  exit 1
+fi
+
+# Security group: create/reuse
 SG_ID="${EC2_SECURITY_GROUP_ID:-}"
 if [[ -z "$SG_ID" ]]; then
   SG_NAME="${NAME_TAG}-sg"
+
   SG_ID="$(aws ec2 describe-security-groups \
     --region "$AWS_REGION" --profile "$AWS_PROFILE" \
     --filters Name=vpc-id,Values="$VPC_ID" Name=group-name,Values="$SG_NAME" \
     --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || true)"
+
   if [[ -z "$SG_ID" || "$SG_ID" == "None" ]]; then
     SG_ID="$(aws ec2 create-security-group \
       --region "$AWS_REGION" --profile "$AWS_PROFILE" \
@@ -54,7 +86,7 @@ if [[ -z "$SG_ID" ]]; then
       --query GroupId --output text)"
   fi
 
-  # Allow SSH from current IP (or override via EC2_SSH_CIDR)
+  # Allow SSH from current IP (or override with EC2_SSH_CIDR)
   MYIP="${EC2_SSH_CIDR:-$(curl -s https://checkip.amazonaws.com)/32}"
   aws ec2 authorize-security-group-ingress \
     --region "$AWS_REGION" --profile "$AWS_PROFILE" \
@@ -62,49 +94,49 @@ if [[ -z "$SG_ID" ]]; then
     >/dev/null 2>&1 || true
 fi
 
-# Helper: get latest spot price for an instance type (Linux/UNIX)
 spot_price() {
   local itype="$1"
+  # Use a recent window; compatible with macOS date and GNU date
+  local start
+  start="$(date -u -v-6H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '6 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
   aws ec2 describe-spot-price-history \
     --region "$AWS_REGION" --profile "$AWS_PROFILE" \
     --instance-types "$itype" \
     --product-descriptions "Linux/UNIX" \
-    --start-time "$(date -u -v-6H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '6 hours ago' +%Y-%m-%dT%H:%M:%SZ)" \
+    --start-time "$start" \
     --max-items 1 \
     --query "SpotPriceHistory[0].SpotPrice" \
     --output text 2>/dev/null || echo "None"
 }
 
-# Sort candidates by spot price (best effort)
+# Order candidates by recent spot price when possible; otherwise keep original order
 declare -a priced=()
 for it in $CANDIDATES; do
   p="$(spot_price "$it")"
-  if [[ "$p" != "None" && "$p" != "null" && "$p" != "NoneType" ]]; then
+  if [[ "$p" != "None" && "$p" != "null" && "$p" != "NoneType" && "$p" != "" ]]; then
     priced+=("$p $it")
   fi
 done
 
-# If we got prices, sort by numeric price; else just use candidates order
 if [[ ${#priced[@]} -gt 0 ]]; then
   mapfile -t ORDERED < <(printf "%s\n" "${priced[@]}" | sort -n | awk '{print $2}')
 else
   mapfile -t ORDERED < <(printf "%s\n" $CANDIDATES)
 fi
 
-echo "Launch plan (Spot-first, 4 GPUs):"
-echo "  Region:   $AWS_REGION"
-echo "  Profile:  $AWS_PROFILE"
-echo "  AMI:      $AMI_ID"
-echo "  Subnet:   $SUBNET_ID"
-echo "  SG:       $SG_ID"
-echo "  Root:     ${VOLUME_GB}GB gp3"
-echo "  Candidates (ordered): ${ORDERED[*]}"
+echo "Launch plan (Spot-first 4-GPU, fallback to On-Demand):"
+echo "  Region:      $AWS_REGION"
+echo "  Profile:     $AWS_PROFILE"
+echo "  AMI:         $AMI_ID"
+echo "  Subnet:      $SUBNET_ID"
+echo "  SG:          $SG_ID"
+echo "  Root volume: ${VOLUME_GB}GB gp3"
+echo "  Candidates:  ${ORDERED[*]}"
 echo
 
 run_instance() {
   local market="$1" itype="$2"
-  local market_args=()
-
+  local -a market_args=()
   if [[ "$market" == "spot" ]]; then
     market_args=(--instance-market-options "MarketType=spot,SpotOptions={SpotInstanceType=one-time,InstanceInterruptionBehavior=terminate}")
   fi
@@ -122,7 +154,6 @@ run_instance() {
     --query "Instances[0].InstanceId" --output text
 }
 
-# Try Spot first (cheapest spot price ordering); on failure, try next type.
 IID=""
 CHOSEN_TYPE=""
 CHOSEN_MARKET=""
@@ -142,7 +173,6 @@ for it in "${ORDERED[@]}"; do
   fi
 done
 
-# If Spot failed entirely, fall back to On-Demand, cheapest-first using same ordering.
 if [[ -z "$IID" ]]; then
   echo
   echo "Spot not available/fulfilled. Falling back to On-Demand..."
@@ -162,17 +192,17 @@ if [[ -z "$IID" ]]; then
 fi
 
 if [[ -z "$IID" ]]; then
-  echo "ERROR: Could not launch any 4-GPU instance (spot or on-demand)." >&2
+  echo "ERROR: Could not launch any 4-GPU instance (spot or on-demand) in $AWS_REGION." >&2
   exit 1
 fi
 
-echo
 echo "$IID" > "$STATE_FILE"
+echo
 echo "Launched: $IID"
 echo "  InstanceType: $CHOSEN_TYPE"
 echo "  Market:       $CHOSEN_MARKET"
 echo "  Saved state:  $STATE_FILE"
-
+echo
 echo "Waiting for running..."
 aws ec2 wait instance-running --region "$AWS_REGION" --profile "$AWS_PROFILE" --instance-ids "$IID"
 
@@ -181,6 +211,12 @@ DNS="$(aws ec2 describe-instances \
   --instance-ids "$IID" \
   --query "Reservations[0].Instances[0].PublicDnsName" --output text)"
 
+IP="$(aws ec2 describe-instances \
+  --region "$AWS_REGION" --profile "$AWS_PROFILE" \
+  --instance-ids "$IID" \
+  --query "Reservations[0].Instances[0].PublicIpAddress" --output text)"
+
 echo "Public DNS: $DNS"
+echo "Public IP:  $IP"
 echo "SSH:"
 echo "  ssh -i ${EC2_SSH_KEY_PATH:-~/.ssh/my-ec2-key} ${EC2_DEFAULT_USER:-ubuntu}@${DNS}"
