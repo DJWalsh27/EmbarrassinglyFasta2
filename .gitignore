@@ -11,3 +11,6 @@ results/
 
 # secrets (DO NOT COMMIT)
 manifests/secrets.env
+
+# local EC2 state (DO NOT COMMIT)
+manifests/ec2.state
