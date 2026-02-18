@@ -1,0 +1,10 @@
+# local secrets
+manifests/aws.env
+*.pem
+
+# runtime outputs
+logs/
+results/
+*.log
+*.tmp
+.DS_Store
